@@ -420,6 +420,7 @@ async function maybeGeocode(force=false){
     const p=await reverseGeocode(st.pos);
     st.lastGeoAt=now(); st.lastGeoPos={...st.pos};
     const prev=st.place; st.place=p; renderPlace();
+    if(!prev || prev.county!==p.county) maybeRefreshPool(true);
     if(prev && p.state && prev.state && p.state!==prev.state){
       log('sys', `Crossed into <b>${esc(p.state)}</b>.`);
       if(S.welcome) st.priority={type:'state', term:p.state};
@@ -435,16 +436,34 @@ async function reverseGeocode({lat,lon}){
     const r=await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
     if(!r.ok) throw 0; const j=await r.json();
     const admin=j.localityInfo?.administrative||[];
-    const county=(admin.find(a=>/ (county|parish|borough)$/i.test(a.name||''))||{}).name||'';
-    return {city:j.city||j.locality||'', county, state:j.principalSubdivision||'', stateCode:(j.principalSubdivisionCode||'').split('-')[1]||'', country:j.countryCode||''};
+    const cty=admin.find(a=>/ (county|parish|borough|census area)$/i.test(a.name||'')) || admin.find(a=>a.adminLevel===6) || {};
+    const cityName=j.city||j.locality||'';
+    const cityE=admin.filter(a=>a.wikidataId && a.name===cityName).pop() || admin.filter(a=>a.wikidataId && (a.adminLevel||0)>=7).pop() || {};
+    return {city:cityName, county:cty.name||'', countyQid:cty.wikidataId||'', cityQid:cityE.wikidataId||'',
+      state:j.principalSubdivision||'', stateCode:(j.principalSubdivisionCode||'').split('-')[1]||'', country:j.countryCode||''};
   }catch{
-    const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=12&lat=${lat}&lon=${lon}`);
+    const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&extratags=1&lat=${lat}&lon=${lon}`);
     const j=await r.json(); const a=j.address||{};
-    return {city:a.city||a.town||a.village||a.hamlet||a.suburb||'', county:a.county||'', state:a.state||'', stateCode:'', country:(a.country_code||'').toUpperCase()};
+    return {city:a.city||a.town||a.village||a.hamlet||a.suburb||'', county:a.county||'', countyQid:'', cityQid:'',
+      state:a.state||'', stateCode:'', country:(a.country_code||'').toUpperCase()};
   }
 }
+// Find a Wikidata ID by name when the geocoder didn't supply one
+async function findQid(name, state){
+  if(!name) return '';
+  try{
+    const u=`https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&origin=*&language=en&type=item&limit=7&search=${encodeURIComponent(name)}`;
+    const j=await (await fetch(u)).json();
+    const hits=j.search||[];
+    const h=hits.find(x=>state && (x.description||'').includes(state)) || hits.find(x=>/county|parish|city|town|village/i.test(x.description||''));
+    return h?.id||'';
+  }catch{ return ''; }
+}
 
-// ---------- local musician pool (Wikidata) ----------
+// ---------- local musician pool (Wikidata, looked up by county) ----------
+// For each county/parish on the road we ask Wikidata for musicians born or formed
+// in that county or any town in it. Results are cached, so each county is fetched once.
+const areaCache=new Map();   // areaQid -> {name, artists:[]}
 function lookaheadCenter(){
   if(!st.pos) return null;
   const v=st.speedMps??0; if(st.heading==null || v<5) return {...st.pos};
@@ -452,39 +471,61 @@ function lookaheadCenter(){
   return project(st.pos, st.heading, km);
 }
 function maybeRefreshPool(force=false){
-  if(st.poolLoading || !st.pos) return;
-  if(!force && now()-st.poolFailedAt<45000) return;
-  const c=lookaheadCenter(); const v=VARIETY[S.variety];
-  const key=S.variety;
-  if(!force && st.poolCenter && st.poolKey===key && haversineKm(st.poolCenter,c) < v.radius*0.33) return;
-  loadPool(c, v.radius).catch(()=>{});
+  if(st.poolLoading || !st.pos || !st.place) return;
+  if(!force && now()-st.poolFailedAt<30000) return;
+  if(!force && st.poolCheckPos && haversineKm(st.poolCheckPos, st.pos)<4) return;
+  st.poolCheckPos={...st.pos};
+  loadPool().catch(e=>console.warn(e));
 }
-async function loadPool(center, radiusKm){
+async function areaRoots(place){
+  let county=place.countyQid, city=place.cityQid;
+  if(!county && place.county) county=place.countyQid=await findQid(place.county, place.state);
+  if(!county && !city && place.city) city=place.cityQid=await findQid(place.city, place.state);
+  return [county, city].filter(Boolean);
+}
+async function loadPool(){
   if(st.poolLoading) return;
   st.poolLoading=true;
   try{
-    for(let r=radiusKm; ; r=Math.round(r*0.55)){
-      const res=await fetchPool(center, r);
-      if(res==='ok') return;
-      if(res!=='timeout' || r<=25) return;
+    const areas=[st.place];
+    const ahead=lookaheadCenter();
+    if(ahead && st.pos && haversineKm(ahead, st.pos)>3){
+      try{ const pa=await reverseGeocode(ahead); if(pa.countyQid!==st.place.countyQid || pa.county!==st.place.county) areas.push(pa); }catch{}
     }
+    const keys=[];
+    for(const a of areas){
+      const roots=await areaRoots(a); if(!roots.length) continue;
+      const key=roots[0]; keys.push(key);
+      if(!areaCache.has(key)){
+        const artists=await fetchArea(roots);
+        if(artists){ areaCache.set(key, {name:a.county||a.city, artists});
+          const label=`${a.county||a.city}${a.state?', '+a.state:''}`;
+          if(st.running && st.lastPoolLabel!==label){ st.lastPoolLabel=label; log('sys', `Found <b>${artists.length}</b> musicians from ${esc(label)}.`); } }
+      }
+    }
+    const merged=new Map();
+    for(const k of keys){ for(const ar of (areaCache.get(k)?.artists||[])) if(!merged.has(ar.qid)) merged.set(ar.qid, ar); }
+    if(merged.size || keys.length) st.pool=[...merged.values()];
+    if(areaCache.size>40){ const first=areaCache.keys().next().value; areaCache.delete(first); }
   }finally{ st.poolLoading=false; renderPlaceMeta(); }
 }
-async function fetchPool(center, radiusKm){
-  const q=`SELECT ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?dist ?links
+async function fetchArea(roots){
+  const vals=roots.map(q=>'wd:'+q).join(' ');
+  const q=`SELECT ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?links
  (GROUP_CONCAT(DISTINCT ?genreLabel; separator="|") AS ?genres) (MIN(?startY) AS ?start) (MIN(?bornY) AS ?born) WHERE {
-  SERVICE wikibase:around { ?place wdt:P625 ?loc . bd:serviceParam wikibase:center "Point(${center.lon.toFixed(4)} ${center.lat.toFixed(4)})"^^geo:wktLiteral .
-    bd:serviceParam wikibase:radius "${radiusKm}" . bd:serviceParam wikibase:distance ?dist . }
+  VALUES ?root { ${vals} }
+  { BIND(?root AS ?place) } UNION { ?place wdt:P131 ?root . }
   { ?item wdt:P19 ?place . BIND("born" AS ?rel) } UNION { ?item wdt:P740 ?place . BIND("formed" AS ?rel) }
   ?item wdt:P1902 ?spotify .
   ?item wikibase:sitelinks ?links .
+  OPTIONAL { ?place wdt:P625 ?loc . }
   OPTIONAL { ?item wdt:P136 ?genre . ?genre rdfs:label ?genreLabel . FILTER(LANG(?genreLabel) = "en") }
   OPTIONAL { ?item wdt:P2031 ?s . BIND(YEAR(?s) AS ?startY) }
   OPTIONAL { ?item wdt:P569 ?b . BIND(YEAR(?b) AS ?bornY) }
   OPTIONAL { ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en") }
   OPTIONAL { ?place rdfs:label ?placeLabel . FILTER(LANG(?placeLabel) = "en") }
-} GROUP BY ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?dist ?links ORDER BY DESC(?links) LIMIT 300`;
-  const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(), 30000);
+} GROUP BY ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?links ORDER BY DESC(?links) LIMIT 400`;
+  const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(), 25000);
   try{
     const r=await fetch('https://query.wikidata.org/sparql?format=json&query='+encodeURIComponent(q), {headers:{Accept:'application/sparql-results+json'}, signal:ctl.signal});
     if(!r.ok) throw new Error('Wikidata '+r.status);
@@ -494,21 +535,18 @@ async function fetchPool(center, radiusKm){
       const qid=b.item.value.split('/').pop(); const name=b.itemLabel?.value; if(!name || /^Q\d+$/.test(name)) continue;
       const m=(b.loc?.value||'').match(/Point\(([-\d.]+) ([-\d.]+)\)/);
       const a={qid, name, spotifyId:b.spotify.value, place:b.placeLabel?.value||'nearby', rel:b.rel.value,
-        distKm:+b.dist.value, links:+b.links.value, genres:(b.genres?.value||'').split('|').filter(Boolean),
+        links:+b.links.value, genres:(b.genres?.value||'').split('|').filter(Boolean),
         start:b.start?+b.start.value:null, born:b.born?+b.born.value:null, loc:m?{lon:+m[1],lat:+m[2]}:null};
-      const ex=byId.get(qid); if(!ex || a.distKm<ex.distKm) byId.set(qid, a);
+      if(!byId.has(qid) || (a.rel==='born' && byId.get(qid).rel!=='born')) byId.set(qid, a);
     }
-    st.pool=[...byId.values()].filter(a=>!/(comedy|stand-up|podcast|audiobook|novel|poetry)/i.test(a.genres.join(' ')) || /music|rock|pop|country|rap|blues|jazz|soul/i.test(a.genres.join(' ')));
-    st.poolCenter=center; st.poolKey=S.variety;
-    if(st.running && !st.poolAnnounced){ st.poolAnnounced=true; log('sys', `Found <b>${st.pool.length}</b> musicians from within ${Math.round(radiusKm*0.621)} miles. The list keeps updating as you drive.`); }
-    return 'ok';
+    return [...byId.values()].filter(a=>!/(comedy|stand-up|podcast|audiobook|novel|poetry)/i.test(a.genres.join(' ')) || /music|rock|pop|country|rap|blues|jazz|soul/i.test(a.genres.join(' ')));
   }catch(e){
     st.poolFailedAt=now();
-    if(e.name==='AbortError' && radiusKm>25) return 'timeout';
-    log('err', 'Couldn\'t load local musicians ('+esc(e.message||e.name)+'). Will retry.');
-    return 'error';
+    log('err', 'Couldn\'t load local musicians ('+esc(e.name==='AbortError'?'Wikidata was too slow':e.message)+'). Place-name songs keep playing; will retry.');
+    return null;
   }finally{ clearTimeout(to); }
 }
+function artistDistKm(a){ return (a.loc && st.pos) ? haversineKm(st.pos, a.loc) : 15; }
 function eraRange(){ return S.era==='any' ? null : [+S.era, +S.era+9]; }
 function eligibleArtists(strict=true){
   const g=GENRES[S.genre], er=eraRange();
@@ -541,7 +579,7 @@ async function pickLocal(dry){
   const radius=v.radius;
   for(let attempt=0; attempt<3; attempt++){
     const a=weightedPick(ranked, x=>{ const fame=S.variety==='wild'?1+Math.log1p(x.links)*0.4:Math.log1p(x.links)**2;
-      const near=1.4-Math.min(1, x.distKm/radius); const known=x.genres.length?1:0.35; return fame*near*known; });
+      const near=1.4-Math.min(1, artistDistKm(x)/radius); const known=x.genres.length?1:0.35; return fame*near*known; });
     if(!a) return null;
     const dirTxt = (a.loc && st.pos) ? `${Math.max(1,Math.round(haversineKm(st.pos,a.loc)*0.621))} mi ${relDir(st.heading, bearing(st.pos,a.loc))}` : 'nearby';
     const why = `${a.name} ${a.rel==='born'?'was born in':'got started in'} ${a.place}, ${dirTxt}.${relaxed?' (Nothing nearby matched your genre lock.)':''}`;
@@ -564,7 +602,7 @@ async function pickPlaceSong(dry, forcedTerm){
   if(forcedTerm) terms.push(forcedTerm);
   else{
     if(p.city) terms.push(p.city);
-    const nearby=[...new Set(st.pool.filter(a=>a.distKm<35).map(a=>a.place))].filter(x=>x && x!==p.city && x.length>3 && !/county|parish|united states/i.test(x));
+    const nearby=[...new Set(st.pool.filter(a=>artistDistKm(a)<35).map(a=>a.place))].filter(x=>x && x!==p.city && x.length>3 && !/county|parish|united states/i.test(x));
     for(let i=0;i<2 && nearby.length;i++) terms.push(nearby.splice(rand(nearby.length),1)[0]);
     if(p.state) terms.push(p.state);
     if(p.county){ const c=p.county.replace(/ (County|Parish|Borough)$/i,''); if(c.length>4 && c!==p.city) terms.push(c); }
@@ -639,8 +677,9 @@ Reply with only a JSON array: [{"title":"...","artist":"...","year":1975,"connec
 async function pickSong(dry=false){
   if(!st.pos){ return null; }
   if(!st.place) await maybeGeocode(true);
-  if(!st.pool.length && !st.poolLoading) await loadPool(lookaheadCenter(), VARIETY[S.variety].radius).catch(()=>{});
-  while(st.poolLoading) await sleep(300);
+  for(let i=0;i<40 && !st.place;i++) await sleep(250);   // a geocode may already be in flight
+  if(!st.pool.length && !st.poolLoading && st.place) loadPool().catch(()=>{});
+  for(let i=0;i<40 && st.poolLoading && !st.pool.length;i++) await sleep(250);   // wait up to 10 s, then fall back to place songs
 
   if(st.priority){ const pr=st.priority; st.priority=null;
     if(pr.type==='state'){ const s=await pickPlaceSong(dry, pr.term); if(s) return s; }
@@ -732,7 +771,7 @@ async function spinNow(){
   finally{ st.busy=false; setTimeout(djTick, 1500); }
 }
 async function startDJ(){
-  st.running=true; st.poolAnnounced=false; $('btnStart').textContent='Stop DJ'; $('btnStart').className='btn stop';
+  st.running=true; $('btnStart').textContent='Stop DJ'; $('btnStart').className='btn stop';
   setStatus(S.source==='sim'?'Test drive rolling':'Finding you…','warn');
   startLocation(); requestWake();
   log('sys', S.source==='sim' ? `Test drive: ${esc(ROUTES[S.route].label)} at ${S.simSpeed}×.` : 'DJ started. Live GPS on.');
