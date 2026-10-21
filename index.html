@@ -368,8 +368,14 @@ async function sp(path, {method='GET', query, body}={}, retried=false){
   return j;
 }
 const spotifyConnected = () => !!tok.get();
+const errSeen=new Map();
+function noteErr(where, e){
+  const msg=`${where}: ${e?.status?e.status+' ':''}${e?.message||e}`;
+  if(now()-(errSeen.get(msg)||0) < 120000) return; errSeen.set(msg, now());
+  log('err', esc(msg)); console.warn(msg, e);
+}
 async function searchTracks(q, offset=0){
-  const j=await sp('/search',{query:{q, type:'track', limit:10, offset, market:'from_token'}});
+  const j=await sp('/search',{query:{q, type:'track', limit:10, offset}});
   return (j?.tracks?.items||[]).filter(Boolean);
 }
 
@@ -509,42 +515,62 @@ async function loadPool(){
     if(areaCache.size>40){ const first=areaCache.keys().next().value; areaCache.delete(first); }
   }finally{ st.poolLoading=false; renderPlaceMeta(); }
 }
+// Two small Wikidata requests: (A) who was born/formed here, ranked by fame; (B) details for the top ones.
+async function wdq(query, timeoutMs=20000){
+  const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(), timeoutMs);
+  try{
+    const r=await fetch('https://query.wikidata.org/sparql', {method:'POST', signal:ctl.signal,
+      headers:{'Content-Type':'application/x-www-form-urlencoded', Accept:'application/sparql-results+json'},
+      body:new URLSearchParams({query, format:'json'})});
+    if(!r.ok) throw new Error('Wikidata '+r.status);
+    return (await r.json()).results.bindings;
+  }finally{ clearTimeout(to); }
+}
+const qidOf = b => b?.value?.split('/').pop();
 async function fetchArea(roots){
   const vals=roots.map(q=>'wd:'+q).join(' ');
-  const q=`SELECT ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?links
- (GROUP_CONCAT(DISTINCT ?genreLabel; separator="|") AS ?genres) (MIN(?startY) AS ?start) (MIN(?bornY) AS ?born) WHERE {
+  const limit=Math.max(60, VARIETY[S.variety].topArtists+40);
+  const qA=`SELECT ?item ?place ?rel ?links WHERE {
+  hint:Query hint:optimizer "None" .
   VALUES ?root { ${vals} }
   { BIND(?root AS ?place) } UNION { ?place wdt:P131 ?root . }
   { ?item wdt:P19 ?place . BIND("born" AS ?rel) } UNION { ?item wdt:P740 ?place . BIND("formed" AS ?rel) }
-  ?item wdt:P1902 ?spotify .
+  ?item wdt:P1902 ?sp .
   ?item wikibase:sitelinks ?links .
+} ORDER BY DESC(?links) LIMIT ${limit}`;
+  try{
+    const rowsA=await wdq(qA);
+    const base=new Map();
+    for(const b of rowsA){ const qid=qidOf(b.item); if(!base.has(qid) || (b.rel.value==='born' && base.get(qid).rel!=='born'))
+      base.set(qid, {qid, placeQid:qidOf(b.place), rel:b.rel.value, links:+b.links.value}); }
+    if(!base.size) return [];
+    const tuples=[...base.values()].map(a=>`(wd:${a.qid} wd:${a.placeQid})`).join(' ');
+    const qB=`SELECT ?item ?itemLabel ?spotify ?placeLabel ?loc (GROUP_CONCAT(DISTINCT ?genreLabel; separator="|") AS ?genres) (MIN(?startY) AS ?start) (MIN(?bornY) AS ?born) WHERE {
+  VALUES (?item ?place) { ${tuples} }
+  ?item wdt:P1902 ?spotify .
+  OPTIONAL { ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en") }
+  OPTIONAL { ?place rdfs:label ?placeLabel . FILTER(LANG(?placeLabel) = "en") }
   OPTIONAL { ?place wdt:P625 ?loc . }
   OPTIONAL { ?item wdt:P136 ?genre . ?genre rdfs:label ?genreLabel . FILTER(LANG(?genreLabel) = "en") }
   OPTIONAL { ?item wdt:P2031 ?s . BIND(YEAR(?s) AS ?startY) }
   OPTIONAL { ?item wdt:P569 ?b . BIND(YEAR(?b) AS ?bornY) }
-  OPTIONAL { ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en") }
-  OPTIONAL { ?place rdfs:label ?placeLabel . FILTER(LANG(?placeLabel) = "en") }
-} GROUP BY ?item ?itemLabel ?spotify ?placeLabel ?loc ?rel ?links ORDER BY DESC(?links) LIMIT 400`;
-  const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(), 25000);
-  try{
-    const r=await fetch('https://query.wikidata.org/sparql?format=json&query='+encodeURIComponent(q), {headers:{Accept:'application/sparql-results+json'}, signal:ctl.signal});
-    if(!r.ok) throw new Error('Wikidata '+r.status);
-    const j=await r.json();
-    const byId=new Map();
-    for(const b of j.results.bindings){
-      const qid=b.item.value.split('/').pop(); const name=b.itemLabel?.value; if(!name || /^Q\d+$/.test(name)) continue;
+} GROUP BY ?item ?itemLabel ?spotify ?placeLabel ?loc`;
+    const rowsB=await wdq(qB);
+    const out=new Map();
+    for(const b of rowsB){
+      const qid=qidOf(b.item); const name=b.itemLabel?.value; const a0=base.get(qid);
+      if(!a0 || !name || /^Q\d+$/.test(name) || out.has(qid)) continue;
       const m=(b.loc?.value||'').match(/Point\(([-\d.]+) ([-\d.]+)\)/);
-      const a={qid, name, spotifyId:b.spotify.value, place:b.placeLabel?.value||'nearby', rel:b.rel.value,
-        links:+b.links.value, genres:(b.genres?.value||'').split('|').filter(Boolean),
-        start:b.start?+b.start.value:null, born:b.born?+b.born.value:null, loc:m?{lon:+m[1],lat:+m[2]}:null};
-      if(!byId.has(qid) || (a.rel==='born' && byId.get(qid).rel!=='born')) byId.set(qid, a);
+      out.set(qid, {qid, name, spotifyId:b.spotify.value, place:b.placeLabel?.value||'nearby', rel:a0.rel, links:a0.links,
+        genres:(b.genres?.value||'').split('|').filter(Boolean), start:b.start?+b.start.value:null, born:b.born?+b.born.value:null,
+        loc:m?{lon:+m[1],lat:+m[2]}:null});
     }
-    return [...byId.values()].filter(a=>!/(comedy|stand-up|podcast|audiobook|novel|poetry)/i.test(a.genres.join(' ')) || /music|rock|pop|country|rap|blues|jazz|soul/i.test(a.genres.join(' ')));
+    return [...out.values()].filter(a=>!/(comedy|stand-up|podcast|audiobook|novel|poetry)/i.test(a.genres.join(' ')) || /music|rock|pop|country|rap|blues|jazz|soul/i.test(a.genres.join(' ')));
   }catch(e){
     st.poolFailedAt=now();
     log('err', 'Couldn\'t load local musicians ('+esc(e.name==='AbortError'?'Wikidata was too slow':e.message)+'). Place-name songs keep playing; will retry.');
     return null;
-  }finally{ clearTimeout(to); }
+  }
 }
 function artistDistKm(a){ return (a.loc && st.pos) ? haversineKm(st.pos, a.loc) : 15; }
 function eraRange(){ return S.era==='any' ? null : [+S.era, +S.era+9]; }
@@ -588,7 +614,7 @@ async function pickLocal(dry){
     try{ const off = S.variety==='wild' ? rand(2)*10 : 0;
       tracks=(await searchTracks(`artist:"${a.name}"${yearFilter()}`, off)).filter(t=>t.artists.some(x=>x.id===a.spotifyId)).filter(okTrack);
       if(!tracks.length && off) tracks=(await searchTracks(`artist:"${a.name}"${yearFilter()}`, 0)).filter(t=>t.artists.some(x=>x.id===a.spotifyId)).filter(okTrack);
-    }catch(e){ if(e.status===429) throw e; }
+    }catch(e){ if(e.status===429) throw e; noteErr('Spotify search', e); }
     const t=chooseFrom(tracks);
     if(t){ st.recentArtists.push(a.name); return {track:t, source:'local', why, artistName:a.name}; }
     st.deadArtists.add(a.qid); ranked.splice(ranked.indexOf(a),1);
@@ -616,7 +642,7 @@ async function pickPlaceSong(dry, forcedTerm){
       tracks=await searchTracks(base+genreFilter()+yearFilter(), off);
       if(!tracks.length && off) tracks=await searchTracks(base+genreFilter()+yearFilter(), 0);
       if(!tracks.length && S.genre==='any' && yearFilter()) tracks=await searchTracks(base+yearFilter(),0);
-    }catch(e){ if(e.status===429) throw e; continue; }
+    }catch(e){ if(e.status===429) throw e; noteErr('Spotify search', e); continue; }
     const recent=new Set(st.relaxRecent||forcedTerm?[]:st.recentArtists.slice(-10).map(norm));
     const good=tracks.filter(t=>wordMatch(t.name, term) && okTrack(t) && !recent.has(norm(t.artists[0]?.name)));
     const t=good.length?good[rand(Math.min(good.length, VARIETY[S.variety].pickDepth+2))]:null;
@@ -639,7 +665,7 @@ async function pickAI(dry){
     if(dry && !spotifyConnected()){ st.recentArtists.push(s.artist); return {track:null, source:'ai', why:s.connection, artistName:s.artist, title:s.title}; }
     let tracks=[];
     try{ tracks=await searchTracks(`track:"${s.title}" artist:"${s.artist}"`);
-      if(!tracks.length) tracks=await searchTracks(`${s.title} ${s.artist}`); }catch(e){ if(e.status===429) throw e; }
+      if(!tracks.length) tracks=await searchTracks(`${s.title} ${s.artist}`); }catch(e){ if(e.status===429) throw e; noteErr('Spotify search', e); }
     const t=tracks.find(t=>okTrack(t) && t.artists.some(a=>norm(a.name).includes(norm(s.artist).slice(0,8)) || norm(s.artist).includes(norm(a.name))));
     if(t){ st.recentArtists.push(t.artists[0].name); return {track:t, source:'ai', why:s.connection, artistName:t.artists[0].name}; }
   }
@@ -750,7 +776,7 @@ async function dryTick(){
   lastDryAt=now();
   setStatus('Dry run','on');
   const pick=await pickSong(true);
-  if(!pick){ log('err','No pick here yet (still loading local musicians?).'); return; }
+  if(!pick){ log('err', `No pick for ${esc(st.place?.city||'this spot')} yet — trying again as you move.`); return; }
   if(pick.track){ rememberPlayed(pick.track.id); st.recentLog.push(`${pick.track.artists[0]?.name} – ${pick.track.name}`); }
   else st.recentLog.push(`${pick.artistName}${pick.title?' – '+pick.title:''}`);
   st.current=pick;
